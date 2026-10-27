@@ -89,7 +89,7 @@ public:
 
         send(sock, message.c_str(), message.size(), 0);
 
-        char buf[1024];
+        char buf[2048];
         std::memset(buf, 0, sizeof(buf));
         ssize_t bytes = recv(sock, buf, sizeof(buf) - 1, 0);
         close(sock);
@@ -150,6 +150,7 @@ public:
         last_heartbeat_time = std::chrono::steady_clock::now();
 
         if (args.prev_log_index >= log.size() || log[args.prev_log_index].term != args.prev_log_term) {
+            reply.match_index = log.size() - 1;
             return reply;
         }
 
@@ -200,18 +201,26 @@ public:
             if (role == NodeRole::LEADER) {
                 if (elapsed >= 50) {
                     last_heartbeat_time = now;
-                    AppendEntriesArgs args;
-                    args.term = current_term;
-                    args.leader_id = id;
-                    args.prev_log_index = log.back().index;
-                    args.prev_log_term = log.back().term;
-                    args.leader_commit = commit_index;
-                    auto peer_list = peers;
-                    lock.unlock();
+                    for (const auto& p : peers) {
+                        uint64_t prev_idx = next_index[p.id] > 0 ? next_index[p.id] - 1 : 0;
+                        if (prev_idx >= log.size()) {
+                            prev_idx = log.size() - 1;
+                        }
 
-                    std::string payload = NetworkProtocol::serialize_append_entries(args);
-                    for (const auto& p : peer_list) {
-                        std::thread([p, payload, this]() {
+                        AppendEntriesArgs args;
+                        args.term = current_term;
+                        args.leader_id = id;
+                        args.prev_log_index = prev_idx;
+                        args.prev_log_term = log[prev_idx].term;
+                        args.leader_commit = commit_index;
+
+                        // Include any missing entries for this peer
+                        for (size_t i = prev_idx + 1; i < log.size(); ++i) {
+                            args.entries.push_back(log[i]);
+                        }
+
+                        std::thread([p, args, this]() {
+                            std::string payload = NetworkProtocol::serialize_append_entries(args);
                             std::string reply_str = send_rpc(p.port, payload);
                             AppendEntriesReply reply;
                             if (NetworkProtocol::parse_append_entries_reply(reply_str, reply)) {
@@ -220,6 +229,15 @@ public:
                                     current_term = reply.term;
                                     role = NodeRole::FOLLOWER;
                                     voted_for = -1;
+                                    return;
+                                }
+                                if (role == NodeRole::LEADER) {
+                                    if (reply.success) {
+                                        next_index[p.id] = reply.match_index + 1;
+                                        match_index[p.id] = reply.match_index;
+                                    } else if (next_index[p.id] > 1) {
+                                        next_index[p.id]--;
+                                    }
                                 }
                             }
                         }).detach();
@@ -266,6 +284,11 @@ public:
                                     role = NodeRole::LEADER;
                                     std::cout << ">>> [Node " << id << "] WON ELECTION! Became LEADER for Term " << current_term << " <<<" << std::endl;
                                     last_heartbeat_time = std::chrono::steady_clock::now();
+                                    // Initialize next_index for each peer
+                                    for (const auto& peer : peers) {
+                                        next_index[peer.id] = log.size();
+                                        match_index[peer.id] = 0;
+                                    }
                                 }
                             }
                         }
