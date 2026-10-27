@@ -2,6 +2,7 @@
 #include <string>
 #include <sstream>
 #include <vector>
+#include <algorithm>
 #include "rpc_message.h"
 
 class NetworkProtocol {
