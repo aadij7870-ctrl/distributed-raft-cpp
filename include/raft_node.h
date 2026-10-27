@@ -15,6 +15,7 @@
 #include "log_entry.h"
 #include "rpc_message.h"
 #include "network_protocol.h"
+#include "persistence_manager.h"
 
 enum class NodeRole {
     FOLLOWER,
@@ -56,7 +57,33 @@ public:
         : id(node_id), cluster_size(total_nodes) {
         reset_election_timeout();
         last_heartbeat_time = std::chrono::steady_clock::now();
-        log.push_back({0, 0, CommandType::NOOP, "", ""});
+
+        // Attempt recovery from WAL
+        if (!PersistenceManager::load_state(id, current_term, voted_for, log)) {
+            log.push_back({0, 0, CommandType::NOOP, "", ""});
+            persist();
+        } else {
+            std::cout << "[Node " << id << "] Recovered WAL: Term " << current_term 
+                      << ", Log Entries: " << log.size() << std::endl;
+            // Restore kv_store from existing log
+            apply_all_logs();
+        }
+    }
+
+    void persist() {
+        PersistenceManager::save_state(id, current_term, voted_for, log);
+    }
+
+    void apply_all_logs() {
+        for (const auto& entry : log) {
+            if (entry.type == CommandType::SET) {
+                kv_store[entry.key] = entry.value;
+            } else if (entry.type == CommandType::DEL) {
+                kv_store.erase(entry.key);
+            }
+        }
+        commit_index = log.empty() ? 0 : log.size() - 1;
+        last_applied = commit_index;
     }
 
     void set_peers(const std::vector<PeerInfo>& p) {
@@ -112,6 +139,7 @@ public:
             current_term = args.term;
             role = NodeRole::FOLLOWER;
             voted_for = -1;
+            persist();
         }
 
         uint64_t my_last_index = log.empty() ? 0 : log.back().index;
@@ -122,6 +150,7 @@ public:
 
         if ((voted_for == -1 || voted_for == args.candidate_id) && log_ok) {
             voted_for = args.candidate_id;
+            persist();
             reply.vote_granted = true;
             last_heartbeat_time = std::chrono::steady_clock::now();
             std::cout << "[Node " << id << "] Voted FOR Candidate " << args.candidate_id << " in Term " << current_term << std::endl;
@@ -146,6 +175,7 @@ public:
             current_term = args.term;
             role = NodeRole::FOLLOWER;
             voted_for = -1;
+            persist();
         }
         last_heartbeat_time = std::chrono::steady_clock::now();
 
@@ -155,16 +185,23 @@ public:
         }
 
         uint64_t insert_index = args.prev_log_index + 1;
+        bool log_modified = false;
         for (const auto& entry : args.entries) {
             if (insert_index < log.size()) {
                 if (log[insert_index].term != entry.term) {
                     log.erase(log.begin() + insert_index, log.end());
                     log.push_back(entry);
+                    log_modified = true;
                 }
             } else {
                 log.push_back(entry);
+                log_modified = true;
             }
             insert_index++;
+        }
+
+        if (log_modified) {
+            persist();
         }
 
         reply.success = true;
@@ -214,7 +251,6 @@ public:
                         args.prev_log_term = log[prev_idx].term;
                         args.leader_commit = commit_index;
 
-                        // Include any missing entries for this peer
                         for (size_t i = prev_idx + 1; i < log.size(); ++i) {
                             args.entries.push_back(log[i]);
                         }
@@ -229,6 +265,7 @@ public:
                                     current_term = reply.term;
                                     role = NodeRole::FOLLOWER;
                                     voted_for = -1;
+                                    persist();
                                     return;
                                 }
                                 if (role == NodeRole::LEADER) {
@@ -247,6 +284,7 @@ public:
                 role = NodeRole::CANDIDATE;
                 current_term++;
                 voted_for = id;
+                persist();
                 reset_election_timeout();
                 last_heartbeat_time = now;
 
@@ -276,6 +314,7 @@ public:
                                 current_term = reply.term;
                                 role = NodeRole::FOLLOWER;
                                 voted_for = -1;
+                                persist();
                                 return;
                             }
                             if (reply.vote_granted && current_term == election_term && role == NodeRole::CANDIDATE) {
@@ -284,7 +323,6 @@ public:
                                     role = NodeRole::LEADER;
                                     std::cout << ">>> [Node " << id << "] WON ELECTION! Became LEADER for Term " << current_term << " <<<" << std::endl;
                                     last_heartbeat_time = std::chrono::steady_clock::now();
-                                    // Initialize next_index for each peer
                                     for (const auto& peer : peers) {
                                         next_index[peer.id] = log.size();
                                         match_index[peer.id] = 0;

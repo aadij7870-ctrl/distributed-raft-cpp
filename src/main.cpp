@@ -47,6 +47,7 @@ void client_worker(int client_fd, RaftNode& node) {
                 new_entry.key = key;
                 new_entry.value = val;
                 node.log.push_back(new_entry);
+                node.persist(); // Persist locally before waiting for network replication
 
                 uint64_t target_index = new_entry.index;
                 uint64_t current_term = node.current_term;
