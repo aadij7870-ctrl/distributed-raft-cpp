@@ -10,11 +10,6 @@
 #include "../include/raft_node.h"
 #include "../include/network_protocol.h"
 
-struct PeerConfig {
-    int id;
-    int port;
-};
-
 void client_worker(int client_fd, RaftNode& node) {
     char buffer[2048];
     while (node.running) {
@@ -38,7 +33,6 @@ void client_worker(int client_fd, RaftNode& node) {
                 response = NetworkProtocol::serialize_append_entries_reply(reply);
             }
         } else if (msg.rfind("GET", 0) == 0) {
-            // Client query: "GET <key>\n"
             std::istringstream ss(msg);
             std::string cmd, key;
             ss >> cmd >> key;
@@ -73,7 +67,7 @@ void tcp_server_loop(int port, RaftNode& node) {
     bind(server_fd, (struct sockaddr*)&address, sizeof(address));
     listen(server_fd, 10);
 
-    std::cout << "[Node " << node.id << "] TCP Server listening on port " << port << std::endl;
+    std::cout << "[Node " << node.id << "] Server listening on TCP port " << port << std::endl;
 
     while (node.running) {
         sockaddr_in client_addr{};
@@ -98,9 +92,25 @@ int main(int argc, char* argv[]) {
 
     RaftNode node(node_id, 3);
 
-    std::cout << "Starting Raft Node " << node_id << " (Cluster Size: 3)...\n";
+    // Standard 3-node cluster map: 1:9001, 2:9002, 3:9003
+    std::vector<PeerInfo> peers;
+    for (int id = 1; id <= 3; ++id) {
+        if (id != node_id) {
+            peers.push_back({id, 9000 + id});
+        }
+    }
+    node.set_peers(peers);
+
+    std::cout << "Starting Raft Node " << node_id << " on port " << port << "...\n";
+
+    // 1. Start TCP listener thread
     std::thread server_thread(tcp_server_loop, port, std::ref(node));
+
+    // 2. Start Raft event loop thread (elections + heartbeats)
+    std::thread raft_loop_thread(&RaftNode::run_event_loop, &node);
+
     server_thread.join();
+    raft_loop_thread.join();
 
     return 0;
 }
