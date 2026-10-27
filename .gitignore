@@ -1,3 +1,4 @@
 test_raft_core
 raft_node
 *.o
+*.log

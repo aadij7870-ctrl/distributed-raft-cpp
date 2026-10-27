@@ -7,6 +7,7 @@
 #include <random>
 #include <thread>
 #include <atomic>
+#include <memory>
 #include <functional>
 #include <unistd.h>
 #include <arpa/inet.h>
@@ -63,12 +64,11 @@ public:
     }
 
     void reset_election_timeout() {
-        static thread_local std::mt19937 generator(std::random_device{}() + id);
-        std::uniform_int_distribution<int> distribution(150, 300);
+        static thread_local std::mt19937 generator(std::random_device{}() + id * 100);
+        std::uniform_int_distribution<int> distribution(300, 600);
         election_timeout_ms = distribution(generator);
     }
 
-    // Helper: Send a TCP string message to a peer port and read one-line reply
     static std::string send_rpc(int port, const std::string& message) {
         int sock = socket(AF_INET, SOCK_STREAM, 0);
         if (sock < 0) return "";
@@ -78,8 +78,7 @@ public:
         serv_addr.sin_port = htons(port);
         inet_pton(AF_INET, "127.0.0.1", &serv_addr.sin_addr);
 
-        // Fast connection timeout
-        struct timeval tv{0, 50000}; // 50ms timeout
+        struct timeval tv{0, 300000};
         setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
         setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 
@@ -91,15 +90,14 @@ public:
         send(sock, message.c_str(), message.size(), 0);
 
         char buf[1024];
+        std::memset(buf, 0, sizeof(buf));
         ssize_t bytes = recv(sock, buf, sizeof(buf) - 1, 0);
         close(sock);
 
         if (bytes <= 0) return "";
-        buf[bytes] = '\0';
-        return std::string(buf);
+        return std::string(buf, bytes);
     }
 
-    // --- RPC Handler 1: RequestVote ---
     RequestVoteReply handle_request_vote(const RequestVoteArgs& args) {
         std::lock_guard<std::mutex> lock(mtx);
         RequestVoteReply reply;
@@ -126,13 +124,13 @@ public:
             voted_for = args.candidate_id;
             reply.vote_granted = true;
             last_heartbeat_time = std::chrono::steady_clock::now();
+            std::cout << "[Node " << id << "] Voted FOR Candidate " << args.candidate_id << " in Term " << current_term << std::endl;
         }
 
         reply.term = current_term;
         return reply;
     }
 
-    // --- RPC Handler 2: AppendEntries ---
     AppendEntriesReply handle_append_entries(const AppendEntriesArgs& args) {
         std::lock_guard<std::mutex> lock(mtx);
         AppendEntriesReply reply;
@@ -191,17 +189,15 @@ public:
         }
     }
 
-    // --- Background Loop: Election Timer & Heartbeats ---
     void run_event_loop() {
         while (running) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+            std::this_thread::sleep_for(std::chrono::milliseconds(25));
 
             std::unique_lock<std::mutex> lock(mtx);
             auto now = std::chrono::steady_clock::now();
             auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_heartbeat_time).count();
 
             if (role == NodeRole::LEADER) {
-                // Heartbeat period: 50ms
                 if (elapsed >= 50) {
                     last_heartbeat_time = now;
                     AppendEntriesArgs args;
@@ -230,14 +226,13 @@ public:
                     }
                 }
             } else if (elapsed >= election_timeout_ms) {
-                // Trigger election
                 role = NodeRole::CANDIDATE;
                 current_term++;
                 voted_for = id;
                 reset_election_timeout();
                 last_heartbeat_time = now;
 
-                std::cout << "[Node " << id << "] Election timeout reached! Starting election for Term " << current_term << std::endl;
+                std::cout << "[Node " << id << "] Election timeout! Starting election for Term " << current_term << std::endl;
 
                 RequestVoteArgs args;
                 args.term = current_term;
@@ -245,33 +240,36 @@ public:
                 args.last_log_index = log.back().index;
                 args.last_log_term = log.back().term;
 
-                int votes_received = 1; // Vote for self
                 auto peer_list = peers;
                 uint64_t election_term = current_term;
+                auto votes_collected = std::make_shared<std::atomic<int>>(1);
                 lock.unlock();
 
                 std::string payload = NetworkProtocol::serialize_request_vote(args);
                 for (const auto& p : peer_list) {
-                    std::string reply_str = send_rpc(p.port, payload);
-                    RequestVoteReply reply;
-                    if (NetworkProtocol::parse_request_vote_reply(reply_str, reply)) {
-                        std::lock_guard<std::mutex> lk(mtx);
-                        if (reply.term > current_term) {
-                            current_term = reply.term;
-                            role = NodeRole::FOLLOWER;
-                            voted_for = -1;
-                            break;
-                        }
-                        if (role == NodeRole::CANDIDATE && current_term == election_term && reply.vote_granted) {
-                            votes_received++;
-                            if (votes_received > cluster_size / 2) {
-                                role = NodeRole::LEADER;
-                                std::cout << ">>> [Node " << id << "] WON ELECTION! Became LEADER for Term " << current_term << " <<<\n";
-                                last_heartbeat_time = std::chrono::steady_clock::now();
-                                break;
+                    std::thread([p, payload, election_term, votes_collected, this]() {
+                        std::string reply_str = send_rpc(p.port, payload);
+                        RequestVoteReply reply;
+                        bool ok = NetworkProtocol::parse_request_vote_reply(reply_str, reply);
+
+                        if (ok) {
+                            std::lock_guard<std::mutex> lk(mtx);
+                            if (reply.term > current_term) {
+                                current_term = reply.term;
+                                role = NodeRole::FOLLOWER;
+                                voted_for = -1;
+                                return;
+                            }
+                            if (reply.vote_granted && current_term == election_term && role == NodeRole::CANDIDATE) {
+                                int total = ++(*votes_collected);
+                                if (total >= (cluster_size / 2 + 1)) {
+                                    role = NodeRole::LEADER;
+                                    std::cout << ">>> [Node " << id << "] WON ELECTION! Became LEADER for Term " << current_term << " <<<" << std::endl;
+                                    last_heartbeat_time = std::chrono::steady_clock::now();
+                                }
                             }
                         }
-                    }
+                    }).detach();
                 }
             }
         }
